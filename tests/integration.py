@@ -27,7 +27,7 @@ class Client:
 
     def call(self, action, expected=200, **data):
         body = json.dumps({'action': action, 'room': self.room, **data}).encode()
-        request = urllib.request.Request(BASE + 'api.php', body, {'Content-Type': 'application/json', 'X-CSRF-Token': self.csrf})
+        request = urllib.request.Request(BASE + 'index.php?api=1', body, {'Content-Type': 'application/json', 'X-CSRF-Token': self.csrf})
         try:
             response = self.http.open(request)
         except urllib.error.HTTPError as e:
@@ -147,9 +147,12 @@ if __name__ == '__main__':
         port = sock.getsockname()[1]
     BASE = f'http://127.0.0.1:{port}/'
     with tempfile.TemporaryDirectory() as temp:
+        DOCROOT = Path(temp)/'site'
+        DOCROOT.mkdir()
+        (DOCROOT/'index.php').write_bytes((ROOT/'index.php').read_bytes())
         env = dict(os.environ, WATCH_DB=temp + '/test.sqlite', PHP_CLI_SERVER_WORKERS='4')
         log = open(temp + '/server.log', 'w+')
-        process = subprocess.Popen([os.environ.get('PHP_BIN', 'php'), '-S', f'127.0.0.1:{port}', '-t', str(ROOT/'public')], env=env, stdout=log, stderr=log, start_new_session=True)
+        process = subprocess.Popen([os.environ.get('PHP_BIN', 'php'), '-S', f'127.0.0.1:{port}', '-t', str(DOCROOT)], env=env, stdout=log, stderr=log, start_new_session=True)
         try:
             for _ in range(100):
                 try:
