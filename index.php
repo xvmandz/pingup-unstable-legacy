@@ -1,5 +1,7 @@
 <?php
 declare(strict_types=1);
+// Optional TURN configuration. Leave as-is for direct voice connections.
+const VMESTE_ICE_SERVERS = [['urls'=>'stun:stun.l.google.com:19302']];
 
 $apiRequest = isset($_GET['api']);
 if (!extension_loaded('pdo_sqlite') || !extension_loaded('mbstring')) {
@@ -38,6 +40,27 @@ function database(): PDO {
     CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, member TEXT NOT NULL, nick TEXT NOT NULL, body TEXT NOT NULL, created REAL NOT NULL);
     CREATE INDEX IF NOT EXISTS messages_room ON messages(room,id);
     CREATE TABLE IF NOT EXISTS limits (identity TEXT PRIMARY KEY, created REAL NOT NULL);');
+    // Additive migration preserves rooms and chat from the single-file v1.
+    $db->exec('BEGIN IMMEDIATE');
+    $columns=[
+        'rooms'=>['source'=>"TEXT NOT NULL DEFAULT 'youtube'",'title'=>"TEXT NOT NULL DEFAULT ''",'waiting'=>'INTEGER NOT NULL DEFAULT 0','resume'=>'INTEGER NOT NULL DEFAULT 0','chooser'=>'TEXT','media_seq'=>'INTEGER NOT NULL DEFAULT 0'],
+        'members'=>['ready'=>'INTEGER NOT NULL DEFAULT 1','voice'=>"TEXT NOT NULL DEFAULT ''",'last_signal'=>'REAL NOT NULL DEFAULT 0','last_extra'=>'REAL NOT NULL DEFAULT 0','last_reaction'=>'REAL NOT NULL DEFAULT 0']
+    ];
+    foreach ($columns as $table=>$definitions) {
+        $existing=array_column($db->query("PRAGMA table_info($table)")->fetchAll(),'name');
+        foreach ($definitions as $name=>$definition) if (!in_array($name,$existing,true)) $db->exec("ALTER TABLE $table ADD COLUMN $name $definition");
+    }
+    $db->exec('CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,video TEXT NOT NULL,source TEXT NOT NULL,title TEXT NOT NULL,nick TEXT NOT NULL,sort REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS bookmarks(id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,video TEXT NOT NULL,source TEXT NOT NULL,title TEXT NOT NULL,position REAL NOT NULL,note TEXT NOT NULL,nick TEXT NOT NULL,created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,video TEXT NOT NULL,source TEXT NOT NULL,title TEXT NOT NULL,nick TEXT NOT NULL,created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS reactions(id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,nick TEXT NOT NULL,emoji TEXT NOT NULL,created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,sender TEXT NOT NULL,target TEXT NOT NULL,payload TEXT NOT NULL,created REAL NOT NULL);
+    CREATE INDEX IF NOT EXISTS queue_room ON queue(room,sort,id);
+    CREATE INDEX IF NOT EXISTS bookmarks_room ON bookmarks(room,id);
+    CREATE INDEX IF NOT EXISTS history_room ON history(room,id);
+    CREATE INDEX IF NOT EXISTS reactions_room ON reactions(room,id);
+    CREATE INDEX IF NOT EXISTS signals_room ON signals(room,target,id);');
+    $db->exec('COMMIT');
     return $db;
 }
 function query(PDO $db, string $sql, array $params=[]): PDOStatement { $s=$db->prepare($sql); $s->execute($params); return $s; }
@@ -63,16 +86,56 @@ function videoId(string $url): ?string {
     return is_string($id) && preg_match('/^[A-Za-z0-9_-]{11}$/D', $id) ? $id : null;
 }
 
+function media(array $d): array {
+    $url=textField($d,'url',1,2048);
+    $id=videoId($url);
+    $source=$id ? 'youtube' : 'file';
+    if (!$id) {
+        $p=parse_url($url);
+        if (!$p || ($p['scheme']??'')!=='https' || empty($p['host']) || isset($p['user']) || isset($p['pass']) || !filter_var($url,FILTER_VALIDATE_URL) || !preg_match('/\.(mp4|webm)$/i',$p['path']??'')) fail(422,'Нужна ссылка YouTube или прямая HTTPS-ссылка на .mp4 / .webm.');
+        $id=$url;
+    }
+    $title=isset($d['title']) && $d['title']!=='' ? textField($d,'title',1,120) : ($source==='youtube' ? 'YouTube · '.$id : basename(parse_url($url,PHP_URL_PATH)));
+    return ['video'=>$id,'source'=>$source,'title'=>$title];
+}
+function position(array $s, float $now): float { return (float)$s['position']+($s['playing'] ? max(0,$now-(float)$s['updated']) : 0); }
+function loadMedia(PDO $db, string $room, array $m, float $now, string $nick, float $position=0, bool $play=false): void {
+    query($db,'UPDATE rooms SET video=?,source=?,title=?,position=?,playing=?,updated=?,version=version+1,media_seq=media_seq+1 WHERE id=?',[$m['video'],$m['source'],$m['title'],$position,(int)$play,$now,$room]);
+    query($db,'INSERT INTO history(room,video,source,title,nick,created) VALUES(?,?,?,?,?,?)',[$room,$m['video'],$m['source'],$m['title'],$nick,$now]);
+    query($db,'DELETE FROM history WHERE room=? AND id NOT IN (SELECT id FROM history WHERE room=? ORDER BY id DESC LIMIT 100)',[$room,$room]);
+}
+function chooser(array $state, array $me): void {
+    if ($state['chooser'] && $state['chooser']!==$me['id']) fail(403,'Сейчас видео выбирает другой участник.');
+}
+function iceServers(): array {
+    // Optional: define VMESTE_ICE_SERVERS here for your own TURN service.
+    // TURN credentials are visible to room participants, as required by WebRTC.
+    $value=getenv('WATCH_ICE_SERVERS');
+    $servers=$value ? json_decode($value,true) : VMESTE_ICE_SERVERS;
+    return is_array($servers) && array_is_list($servers) ? $servers : [];
+}
+
+function integerField(array $d,string $key,?int $default=null): int {
+    $value=$d[$key]??$default;
+    if (!is_int($value) || $value<0) fail(422,'Некорректный идентификатор.');
+    return $value;
+}
+function numberField(array $d,string $key): float {
+    $v=$d[$key]??null;
+    if (!is_numeric($v) || !is_finite((float)$v) || $v<0 || $v>604800) fail(422,'Некорректная позиция.');
+    return (float)$v;
+}
+
 if ($apiRequest) {
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
 try {
     if ($_SERVER['REQUEST_METHOD']!=='POST') fail(405, 'Используйте POST.');
-    if ((int)($_SERVER['CONTENT_LENGTH']??0)>8192) fail(413, 'Слишком большой запрос.');
+    if ((int)($_SERVER['CONTENT_LENGTH']??0)>32768) fail(413, 'Слишком большой запрос.');
     if (!hash_equals($csrf, $_SERVER['HTTP_X_CSRF_TOKEN']??'')) fail(403, 'Обновите страницу: сессия изменилась.');
-    $input=file_get_contents('php://input', false, null, 0, 8193);
-    if (strlen($input)>8192) fail(413, 'Слишком большой запрос.');
+    $input=file_get_contents('php://input', false, null, 0, 32769);
+    if (strlen($input)>32768) fail(413, 'Слишком большой запрос.');
     $d=json_decode($input, true, 16, JSON_THROW_ON_ERROR);
     if (!is_array($d)) fail(422, 'Некорректный запрос.');
     $action=$d['action']??'';
@@ -106,13 +169,14 @@ try {
             query($db,'INSERT INTO members(room,identity,id,nick,seen) VALUES(?,?,?,?,?) ON CONFLICT(room,identity) DO UPDATE SET nick=excluded.nick,seen=excluded.seen',[$room,$identity,bin2hex(random_bytes(8)),$nick,$now]);
         }
     }
+    if ($action==='join' && query($db,'SELECT waiting FROM rooms WHERE id=?',[$room])->fetchColumn()) query($db,'UPDATE members SET ready=0 WHERE room=? AND identity=?',[$room,$identity]);
     $me=query($db,'SELECT * FROM members WHERE room=? AND identity=?',[$room,$identity])->fetch();
     if (!$me) fail(401,'Сначала войдите в зал.');
     if ($action==='leave') {
         query($db,'DELETE FROM members WHERE room=? AND identity=?',[$room,$identity]);
         $db->exec('COMMIT'); echo '{"ok":true}'; exit;
     }
-    if (!in_array($action,['create','join','state','message','control'],true)) fail(422,'Неизвестное действие.');
+    if (!in_array($action,['create','join','state','message','control','queue','ready','reaction','bookmark','voice','signal'],true)) fail(422,'Неизвестное действие.');
     query($db,'UPDATE members SET seen=? WHERE room=? AND identity=?',[$now,$room,$identity]);
     $state=query($db,'SELECT * FROM rooms WHERE id=?',[$room])->fetch();
     if ($action==='message') {
@@ -122,29 +186,154 @@ try {
         query($db,'UPDATE members SET last_message=? WHERE room=? AND identity=?',[$now,$room,$identity]);
         query($db,'DELETE FROM messages WHERE room=? AND id NOT IN (SELECT id FROM messages WHERE room=? ORDER BY id DESC LIMIT 300)',[$room,$room]);
     }
+    if ($action==='queue') {
+        $op=$d['op']??'';
+        if ($now-(float)$me['last_extra']<0.2) fail(429,'Подождите немного.');
+        if ($op==='add') {
+            $m=media($d);
+            if (query($db,'SELECT COUNT(*) FROM queue WHERE room=?',[$room])->fetchColumn()>=50) fail(422,'В очереди уже 50 видео.');
+            $sort=(float)query($db,'SELECT COALESCE(MAX(sort),0)+1 FROM queue WHERE room=?',[$room])->fetchColumn();
+            query($db,'INSERT INTO queue(room,video,source,title,nick,sort) VALUES(?,?,?,?,?,?)',[$room,$m['video'],$m['source'],$m['title'],$me['nick'],$sort]);
+        } elseif ($op==='remove') query($db,'DELETE FROM queue WHERE room=? AND id=?',[$room,integerField($d,'id')]);
+        elseif ($op==='shuffle') {
+            chooser($state,$me);
+            $items=query($db,'SELECT id FROM queue WHERE room=? ORDER BY sort,id',[$room])->fetchAll(); shuffle($items);
+            foreach ($items as $i=>$item) query($db,'UPDATE queue SET sort=? WHERE id=?',[$i,$item['id']]);
+        } elseif (in_array($op,['up','down'],true)) {
+            $items=query($db,'SELECT id FROM queue WHERE room=? ORDER BY sort,id',[$room])->fetchAll();
+            $ids=array_column($items,'id'); $index=array_search(integerField($d,'id'),array_map('intval',$ids),true);
+            if ($index===false) fail(404,'Видео уже убрали из очереди.');
+            $other=$index+($op==='up'?-1:1);
+            if (isset($ids[$other])) [$ids[$index],$ids[$other]]=[$ids[$other],$ids[$index]];
+            foreach ($ids as $i=>$id) query($db,'UPDATE queue SET sort=? WHERE id=?',[$i,$id]);
+        } else fail(422,'Неизвестное действие очереди.');
+        query($db,'UPDATE members SET last_extra=? WHERE room=? AND identity=?',[$now,$room,$identity]);
+    }
+    if ($action==='ready') {
+        if ($state['waiting']) {
+            query($db,'UPDATE members SET ready=1 WHERE room=? AND identity=?',[$room,$identity]);
+            $active=query($db,'SELECT ready FROM members WHERE room=? AND seen>?',[$room,$now-20])->fetchAll();
+            if (count($active)>=2 && !in_array(0,array_map('intval',array_column($active,'ready')),true)) {
+                query($db,'UPDATE rooms SET waiting=0,playing=resume,updated=?,version=version+1 WHERE id=?',[$now,$room]);
+            }
+        }
+    }
+    if ($action==='reaction') {
+        $emoji=$d['emoji']??'';
+        if (!in_array($emoji,['❤️','😂','😳','🥹','🔥','🍿'],true)) fail(422,'Неизвестная реакция.');
+        if ($now-(float)$me['last_reaction']<0.5) fail(429,'Дайте реакции долететь :)');
+        query($db,'INSERT INTO reactions(room,nick,emoji,created) VALUES(?,?,?,?)',[$room,$me['nick'],$emoji,$now]);
+        query($db,'DELETE FROM reactions WHERE created<?',[$now-8]);
+        query($db,'UPDATE members SET last_reaction=? WHERE room=? AND identity=?',[$now,$room,$identity]);
+    }
+    if ($action==='bookmark') {
+        if (($d['op']??'add')==='remove') query($db,'DELETE FROM bookmarks WHERE room=? AND id=?',[$room,integerField($d,'id')]);
+        else {
+            if (!$state['video']) fail(422,'Сначала выберите видео.');
+            if ($now-(float)$me['last_extra']<0.2) fail(429,'Подождите немного.');
+            $note=textField($d,'note',1,160);
+            query($db,'INSERT INTO bookmarks(room,video,source,title,position,note,nick,created) VALUES(?,?,?,?,?,?,?,?)',[$room,$state['video'],$state['source'],$state['title'],position($state,$now),$note,$me['nick'],$now]);
+            query($db,'DELETE FROM bookmarks WHERE room=? AND id NOT IN (SELECT id FROM bookmarks WHERE room=? ORDER BY id DESC LIMIT 100)',[$room,$room]);
+            query($db,'UPDATE members SET last_extra=? WHERE room=? AND identity=?',[$now,$room,$identity]);
+        }
+    }
+    if ($action==='voice') {
+        $op=$d['op']??'';
+        $peer=$d['peer']??'';
+        if (!is_string($peer) || !preg_match('/^[a-f0-9]{32}$/D',$peer)) fail(422,'Некорректная голосовая сессия.');
+        if ($op==='join') {
+            $count=query($db,"SELECT COUNT(*) FROM members WHERE room=? AND identity<>? AND voice<>'' AND seen>?",[$room,$identity,$now-20])->fetchColumn();
+            if ($count>=2) fail(409,'Голосовой разговор рассчитан на двоих.');
+            query($db,'UPDATE members SET voice=? WHERE room=? AND identity=?',[$peer,$room,$identity]);
+        } elseif ($op==='leave') query($db,"UPDATE members SET voice='' WHERE room=? AND identity=? AND voice=?",[$room,$identity,$peer]);
+        else fail(422,'Неизвестное голосовое действие.');
+    }
+    if ($action==='signal') {
+        if (($d['peer']??null)!==$me['voice'] || !$me['voice']) fail(403,'Голосовая сессия завершена.');
+        if ($now-(float)$me['last_signal']<0.01) fail(429,'Слишком много сигналов.');
+        $target=$d['target']??null;
+        if (!is_string($target) || $target===$me['voice'] || !query($db,'SELECT 1 FROM members WHERE room=? AND voice=? AND seen>?',[$room,$target,$now-20])->fetchColumn()) fail(404,'Собеседник отключился.');
+        $payload=$d['payload']??null;
+        if (!is_array($payload)) fail(422,'Некорректный сигнал.');
+        $type=$payload['type']??'';
+        if (in_array($type,['offer','answer'],true)) {
+            if (!is_string($payload['sdp']??null) || strlen($payload['sdp'])>16000) fail(422,'Некорректный SDP.');
+            $payload=['type'=>$type,'sdp'=>$payload['sdp']];
+        } elseif ($type==='candidate') {
+            $candidate=$payload['candidate']??null;
+            if (!is_array($candidate) || !is_string($candidate['candidate']??null) || strlen($candidate['candidate'])>4096 || (isset($candidate['sdpMid']) && (!is_string($candidate['sdpMid']) || strlen($candidate['sdpMid'])>32)) || (isset($candidate['sdpMLineIndex']) && (!is_int($candidate['sdpMLineIndex']) || $candidate['sdpMLineIndex']<0 || $candidate['sdpMLineIndex']>32))) fail(422,'Некорректный ICE-кандидат.');
+            $payload=['type'=>'candidate','candidate'=>array_intersect_key($candidate,array_flip(['candidate','sdpMid','sdpMLineIndex']))];
+        } else fail(422,'Неизвестный сигнал.');
+        query($db,'INSERT INTO signals(room,sender,target,payload,created) VALUES(?,?,?,?,?)',[$room,$me['voice'],$target,json_encode($payload,JSON_THROW_ON_ERROR),$now]);
+        query($db,'DELETE FROM signals WHERE created<?',[$now-60]);
+        query($db,'UPDATE members SET last_signal=? WHERE room=? AND identity=?',[$now,$room,$identity]);
+    }
     if ($action==='control') {
         if ($now-(float)$me['last_control']<0.15) fail(429,'Слишком частые команды плееру.');
         if (!isset($d['version']) || $d['version']!==(int)$state['version']) fail(409,'Состояние уже изменилось. Повторите действие.');
         $op=$d['op']??'';
-        $position=(float)$state['position']+($state['playing'] ? max(0,$now-(float)$state['updated']) : 0);
-        $video=$state['video']; $playing=(int)$state['playing'];
-        if ($op==='load') { $video=videoId(textField($d,'url',1,2048)); if (!$video) fail(422,'Нужна ссылка на отдельное видео YouTube.'); $position=0; $playing=0; }
-        elseif (!$video) fail(422,'Сначала добавьте видео.');
+        if ($state['waiting'] && !in_array($op,['pause','pass','wait_cancel'],true)) fail(409,'Сначала подтвердите готовность обоих участников.');
+        if (in_array($op,['load','queue_play','next','random','history','bookmark'],true)) chooser($state,$me);
+        $position=position($state,$now); $playing=(int)$state['playing']; $loaded=false;
+        if ($op==='load') { loadMedia($db,$room,media($d),$now,$me['nick']); $loaded=true; }
+        elseif (in_array($op,['queue_play','next','random','ended'],true)) {
+            if ($op==='ended') {
+                $duration=numberField($d,'duration');
+                if (!$state['playing'] || $state['waiting'] || $position<$duration-1 || $duration<1) fail(409,'Видео ещё не закончилось.');
+                $position=$duration;
+            }
+            $sql='SELECT * FROM queue WHERE room=?'; $params=[$room];
+            if ($op==='queue_play') { $sql.=' AND id=?'; $params[]=integerField($d,'id'); }
+            $sql.=$op==='random' ? ' ORDER BY RANDOM() LIMIT 1' : ' ORDER BY sort,id LIMIT 1';
+            $next=query($db,$sql,$params)->fetch();
+            if (!$next && $op!=='ended') fail(404,'Очередь пуста или видео уже выбрано.');
+            if ($next) { loadMedia($db,$room,$next,$now,$me['nick'],0,$op==='ended'); query($db,'DELETE FROM queue WHERE id=?',[$next['id']]); $loaded=true; }
+            else $playing=0;
+        } elseif (in_array($op,['history','bookmark'],true)) {
+            $table=$op==='history' ? 'history' : 'bookmarks';
+            $item=query($db,"SELECT * FROM $table WHERE room=? AND id=?",[$room,integerField($d,'id')])->fetch();
+            if (!$item) fail(404,'Запись не найдена.');
+            loadMedia($db,$room,$item,$now,$me['nick'],(float)($item['position']??0)); $loaded=true;
+        } elseif ($op==='pass') {
+            $target=$d['target']??null;
+            if ($target!==null && (!is_string($target) || !query($db,'SELECT 1 FROM members WHERE room=? AND id=? AND seen>?',[$room,$target,$now-20])->fetchColumn())) fail(404,'Участник не в сети.');
+            // Either participant may restore shared choice if a chooser went away.
+            if ($state['chooser'] && $state['chooser']!==$me['id'] && query($db,'SELECT 1 FROM members WHERE room=? AND id=? AND seen>?',[$room,$state['chooser'],$now-20])->fetchColumn()) fail(403,'Выбор может передать только тот, чья сейчас очередь.');
+            query($db,'UPDATE rooms SET chooser=? WHERE id=?',[$target,$room]);
+        } elseif ($op==='wait_cancel') {
+            query($db,'UPDATE rooms SET waiting=0,resume=0 WHERE id=?',[$room]);
+            query($db,'UPDATE members SET ready=1 WHERE room=?',[$room]); $playing=0;
+        } elseif (!$state['video']) fail(422,'Сначала добавьте видео.');
         elseif ($op==='play') $playing=1;
         elseif ($op==='replay') { $position=0; $playing=1; }
         elseif ($op==='pause') $playing=0;
-        elseif ($op==='seek') { $p=$d['position']??null; if (!is_numeric($p) || !is_finite((float)$p) || $p<0 || $p>604800) fail(422,'Некорректная позиция.'); $position=(float)$p; }
-        else fail(422,'Неизвестная команда плееру.');
-        query($db,'UPDATE rooms SET video=?,position=?,playing=?,updated=?,version=version+1 WHERE id=?',[$video,$position,$playing,$now,$room]);
+        elseif ($op==='seek') $position=numberField($d,'position');
+        elseif ($op==='wait') {
+            query($db,'UPDATE rooms SET waiting=1,resume=? WHERE id=?',[$playing,$room]);
+            query($db,'UPDATE members SET ready=0 WHERE room=?',[$room]); $playing=0;
+        } else fail(422,'Неизвестная команда плееру.');
+        if (!$loaded) query($db,'UPDATE rooms SET position=?,playing=?,updated=?,version=version+1 WHERE id=?',[$position,$playing,$now,$room]);
         query($db,'UPDATE members SET last_control=? WHERE room=? AND identity=?',[$now,$room,$identity]);
-        $state=query($db,'SELECT * FROM rooms WHERE id=?',[$room])->fetch();
     }
     $after=filter_var($d['after']??0,FILTER_VALIDATE_INT);
     if ($after===false || $after<0) fail(422,'Некорректный курсор сообщений.');
     $messages=query($db,'SELECT id,member,nick,body,created FROM (SELECT id,member,nick,body,created FROM messages WHERE room=? AND id>? ORDER BY id DESC LIMIT 100) ORDER BY id',[$room,$after])->fetchAll();
-    $members=query($db,'SELECT id,nick FROM members WHERE room=? AND seen>? ORDER BY nick',[$room,$now-20])->fetchAll();
+    $state=query($db,'SELECT * FROM rooms WHERE id=?',[$room])->fetch();
+    $me=query($db,'SELECT id,nick,ready,voice FROM members WHERE room=? AND identity=?',[$room,$identity])->fetch();
+    $members=query($db,'SELECT id,nick,ready,voice FROM members WHERE room=? AND seen>? ORDER BY nick',[$room,$now-20])->fetchAll();
+    $queue=query($db,'SELECT id,video,source,title,nick FROM queue WHERE room=? ORDER BY sort,id',[$room])->fetchAll();
+    $bookmarks=query($db,'SELECT id,video,source,title,position,note,nick,created FROM bookmarks WHERE room=? ORDER BY id DESC LIMIT 100',[$room])->fetchAll();
+    $history=query($db,'SELECT id,video,source,title,nick,created FROM history WHERE room=? ORDER BY id DESC LIMIT 100',[$room])->fetchAll();
+    $reactions=query($db,'SELECT id,emoji,nick,created FROM reactions WHERE room=? AND created>? ORDER BY id',[$room,$now-5])->fetchAll();
+    $signalAfter=integerField($d,'signalAfter',0);
+    $signals=$me['voice'] ? query($db,'SELECT id,sender,payload FROM signals WHERE room=? AND target=? AND id>? AND created>? ORDER BY id LIMIT 100',[$room,$me['voice'],$signalAfter,$now-60])->fetchAll() : [];
+    foreach ($signals as &$signal) $signal['payload']=json_decode($signal['payload'],true); unset($signal);
     $db->exec('COMMIT');
-    echo json_encode(['room'=>$room,'me'=>['id'=>$me['id'],'nick'=>$me['nick']], 'state'=>['video'=>$state['video'],'position'=>(float)$state['position'],'playing'=>(bool)$state['playing'],'updated'=>(float)$state['updated'],'version'=>(int)$state['version']], 'members'=>$members,'messages'=>$messages,'serverTime'=>$now], JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+    foreach (['version','media_seq'] as $key) $state[$key]=(int)$state[$key];
+    foreach (['position','updated'] as $key) $state[$key]=(float)$state[$key];
+    foreach (['playing','waiting'] as $key) $state[$key]=(bool)$state[$key];
+    unset($state['id'],$state['resume']);
+    echo json_encode(['room'=>$room,'me'=>$me,'state'=>$state,'members'=>$members,'messages'=>$messages,'queue'=>$queue,'bookmarks'=>$bookmarks,'history'=>$history,'reactions'=>$reactions,'signals'=>$signals,'iceServers'=>iceServers(),'serverTime'=>$now],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
 } catch (JsonException $e) { fail(422,'Некорректный JSON.'); }
 catch (Throwable $e) { error_log((string)$e); fail(503,'Сервис временно недоступен. Попробуйте ещё раз.'); }
 
@@ -160,7 +349,7 @@ $nonce = bin2hex(random_bytes(16));
 header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: strict-origin-when-cross-origin');
-header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$nonce' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com; img-src 'self' https://i.ytimg.com data:; style-src 'self' 'nonce-$nonce'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$nonce' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com; img-src 'self' https://i.ytimg.com data:; style-src 'self' 'nonce-$nonce'; media-src 'self' https: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
 ?>
 <!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="csrf-token" content="<?=htmlspecialchars($csrf,ENT_QUOTES)?>"><meta name="theme-color" content="#111015"><title>Вместе — ваш маленький кинозал</title><style nonce="<?=htmlspecialchars($nonce,ENT_QUOTES)?>">
@@ -171,6 +360,10 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$n
 .empty-symbol:before,.big-play:before{border-top-width:9px;border-bottom-width:9px;border-left-width:14px}.youtube-icon:before{border-top-width:3px;border-bottom-width:3px;border-left-width:5px}.youtube-icon{padding:5px 7px}
 .primary>span{font-size:0;width:12px;height:12px;display:block;position:relative}.primary>span:after{content:'';position:absolute;right:1px;top:2px;width:8px;height:8px;border-top:1.5px solid currentColor;border-right:1.5px solid currentColor}.primary>span:before{content:'';position:absolute;width:12px;height:1.5px;background:currentColor;transform:rotate(-45deg);top:6px;left:0}.play-button{font-size:0;display:grid;place-items:center;height:24px}.play-button:before{content:'';border-top:7px solid transparent;border-bottom:7px solid transparent;border-left:11px solid currentColor}.play-button.is-playing:before{height:14px;width:10px;border-top:0;border-bottom:0;border-left:3px solid currentColor;border-right:3px solid currentColor}
 
+.evening-toolbar{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:20px;padding:18px 20px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(100deg,#292033,#19161f)}.evening-toolbar>div:first-child{min-width:0}.evening-toolbar strong{display:block;font-size:16px;font-weight:500;overflow-wrap:anywhere}.evening-toolbar #chooser-label{font-size:10px;color:var(--muted)}.tool-buttons,.voice-buttons{display:flex;gap:8px;flex-wrap:wrap}.tool-buttons button{font-size:11px}.waiting-banner{display:flex;flex-wrap:wrap;align-items:center;gap:15px;background:#3c2c2a;border:1px solid #8d6b56;border-radius:10px;padding:16px 20px;margin-bottom:20px}.waiting-banner b{font-size:13px}.waiting-banner span{font-size:11px;color:var(--peach);flex:1}.waiting-banner .primary{padding:9px 16px;font-size:11px}.video-shell video{width:100%;height:100%;object-fit:contain;background:#08070c;position:absolute;inset:0}#reactions-stage{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:4}.flying-reaction{position:absolute;bottom:10%;font-size:35px;animation:float-reaction 3s ease-out forwards;text-align:center;left:40%}.flying-reaction:nth-child(3n){left:65%}.flying-reaction:nth-child(2n){left:20%}.flying-reaction small{display:block;font-size:11px;text-shadow:0 1px 4px #000;color:white}.flying-reaction p{margin:0}@keyframes float-reaction{from{transform:translateY(0) rotate(-8deg);opacity:1}to{transform:translateY(-140px) rotate(10deg);opacity:0}}.local-controls{display:flex;align-items:center;gap:12px;font-size:10px;color:var(--muted);padding:0 2px 15px;flex-wrap:wrap}.local-controls input{accent-color:var(--accent);width:100px;height:4px}.local-controls select{max-width:55px}.local-controls button{margin-left:auto;font-size:10px;padding:5px 12px}select{background:#272030;color:#dfd2ea;border:1px solid #4a3b56;border-radius:6px;padding:7px;max-width:100%;font:inherit}.reactions-bar{display:flex;align-items:center;gap:10px;padding:8px 0 20px}.reactions-bar>span{font-size:10px;color:var(--muted);margin-right:4px}.reactions-bar button{border:1px solid #44364c;border-radius:50%;background:#251e2e;width:37px;height:37px;font-size:19px;padding:0}.voice-panel{background:#201a28;border:1px solid #3d3049;border-radius:10px;padding:18px;margin:18px 0;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.voice-panel strong{font-size:12px;font-weight:500}.voice-panel p{font-size:10px;color:var(--muted);margin:5px 0}.voice-panel .voice-note{width:100%;font-size:9px}.voice-buttons button{font-size:10px;padding:7px 11px}#voice-start.active{background:#443052;color:#ecd7fc;border-color:#ae86cd}.choice-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:11px;padding:5px 0 18px}.choice-panel>span{flex:1;min-width:140px;color:var(--muted)}.choice-panel select{max-width:160px;font-size:10px}.choice-panel button{font-size:10px;padding:7px 10px}.evening-panels{display:grid;grid-template-columns:1fr 1fr;gap:16px}.feature-panel{background:#1c1822;border:1px solid var(--line);border-radius:11px;padding:17px;min-width:0}.feature-panel h2{font-size:14px;font-weight:500;margin:0 0 12px}.feature-panel h2>span{color:var(--muted);font-size:11px;margin-left:5px}.panel-heading{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.small-button{border:0;color:var(--accent);background:transparent;font-size:10px;padding:3px 4px}.feature-list{max-height:260px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#4b3a59 transparent;margin:10px 0}.feature-item{border-top:1px solid #322b3b;padding:10px 0;overflow-wrap:anywhere}.feature-item strong{display:block;font-size:11px;font-weight:500;color:#e1d6e9}.feature-item small{font-size:9px;color:var(--muted);display:block}.item-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}.item-actions button{font-size:10px;color:var(--accent);background:#2c2235;border:1px solid #42304e;border-radius:5px;padding:3px 8px}.feature-panel>.outline{font-size:10px;padding:6px 10px}.empty-note{color:var(--muted);font-size:10px;line-height:1.7}.history-panel{grid-column:1/-1}.history-day{font-size:11px;color:var(--peach);padding:10px 0 0}.history-panel .feature-list{max-height:240px}#bookmark-form{display:flex;gap:8px;flex-wrap:wrap}#bookmark-note{background:#15111a;border:1px solid #44354f;border-radius:6px;padding:9px;font-size:11px;width:100%;flex:1;min-width:110px}#bookmark-form button{font-size:10px;padding:7px 10px}.video-form .title-input{width:100%;font-size:11px;padding:10px 0 0}.video-form .media-help{font-size:9px;color:var(--muted);display:block;margin-top:9px}.video-submit-buttons{display:flex;gap:6px}.video-form .queue-add{background:#382b45;color:#dac2ed}.room-grid{align-items:start}.chat-panel{position:sticky;top:15px;max-height:680px;height:680px}.chat-panel.is-hidden{display:none}.room-grid.chat-closed{grid-template-columns:1fr}.room-grid.chat-closed .watch-column{max-width:100%}body.cinema .header,body.cinema footer{display:none}body.cinema main{max-width:100%;padding:0 2%}body.cinema .room{padding-top:16px}body.cinema .room-heading{margin-bottom:15px}body.cinema .video-shell{max-height:78vh;aspect-ratio:16/9}body.cinema .room-grid{grid-template-columns:minmax(0,1fr) 280px}body.cinema .room-grid.chat-closed{grid-template-columns:1fr}.watch-column:fullscreen{overflow:auto;background:#111015;padding:12px}.watch-column:fullscreen .video-shell{height:75vh;aspect-ratio:auto}.watch-column:fullscreen .evening-panels,.watch-column:fullscreen .room-tip{display:none}.player-controls{flex-wrap:nowrap}.player-controls input{min-width:20px}.video-form>div{flex-wrap:wrap}.video-form #video-url{min-width:100px}.video-submit-buttons .primary{gap:8px}.choice-panel select{width:160px}@media(max-width:1050px){.evening-panels{grid-template-columns:1fr}.history-panel{grid-column:auto}.tool-buttons{gap:5px}.tool-buttons button{padding:7px 9px}.evening-toolbar{align-items:flex-start;flex-direction:column}.video-submit-buttons{width:100%}.video-submit-buttons .primary{flex:1;justify-content:center}.video-form #video-url{padding:7px 0}.choice-panel>span{width:100%;flex-basis:100%}}@media(max-width:760px){.evening-toolbar{padding:14px;margin-bottom:14px}.evening-toolbar strong{font-size:14px}.tool-buttons{width:100%}.tool-buttons button{flex:1;font-size:10px;padding:7px}.waiting-banner{padding:13px;gap:8px}.waiting-banner b{width:100%}.room-heading h1{font-size:24px}.chat-panel{position:static;height:420px;min-height:420px;max-height:420px}.local-controls{gap:8px}.local-controls label{font-size:9px}.local-controls select{font-size:9px}.reactions-bar{gap:8px}.reactions-bar button{width:32px;height:32px;font-size:17px}.reactions-bar>span{font-size:9px}.voice-panel{padding:14px}.voice-buttons{width:100%}.evening-panels{gap:12px}.choice-panel{gap:7px}.feature-panel{padding:14px}body.cinema .room-grid{grid-template-columns:1fr}body.cinema .video-shell{max-height:none}.video-shell{min-height:200px}.watch-column:fullscreen .video-shell{height:60vh}.sound-button{max-width:84px}.video-form .title-input{padding-top:8px}body.cinema .chat-panel{height:350px;min-height:350px}.room-actions{gap:7px}}@media(prefers-reduced-motion:reduce){.flying-reaction{animation:none;position:static;display:inline-block;margin:15px;font-size:28px}}
+
+
+@media(max-width:760px){.chat-panel{position:fixed;z-index:12;right:12px;left:12px;bottom:12px;top:auto;height:min(70dvh,520px);min-height:280px;max-height:70dvh;box-shadow:0 10px 80px #000b;border-color:#715181}.chat-panel .messages{min-height:100px}.chat-header{padding:13px 16px 10px}.chat-header #member-count{margin-left:auto;margin-right:10px}#chat-close{font-size:24px;line-height:1}body.cinema .chat-panel{height:min(70dvh,520px);min-height:280px}}
 </style></head>
 <body>
 <header class="header"><a href="./" class="brand" aria-label="Вместе, главная"><span class="brand-icon">▶</span> вместе<span class="brand-dot">.</span></a><span class="header-note">Далеко друг от друга. Рядом в моменте.</span><span class="header-tag"><i></i> ВАШ ЛИЧНЫЙ КИНОЗАЛ</span></header>
@@ -181,8 +374,15 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$n
 </section>
 <section id="room" class="room" hidden>
 <div class="room-heading"><div><span class="eyebrow">МЕСТО ДЛЯ ВАШЕГО ВЕЧЕРА</span><h1>Наш маленький зал<span>.</span></h1></div><div class="room-actions"><span id="connection" class="connection" role="status">Подключаемся…</span><button id="invite" class="outline">+ Пригласить</button><button id="leave" class="icon-button" title="Выйти из зала" aria-label="Выйти из зала">⏻</button></div></div>
-<div class="room-grid"><div class="watch-column"><div class="video-shell"><div id="player"></div><div id="empty-player" class="empty-player"><div class="empty-symbol">▶</div><span class="eyebrow">ЛУЧШЕ, КОГДА ВМЕСТЕ</span><h2>С чего начнём вечер?</h2><p>Добавьте ссылку на YouTube ниже.<br>Попкорн — по желанию.</p></div></div><div class="player-controls"><button id="play" class="play-button" disabled aria-label="Воспроизвести для всех">▶</button><span id="position">0:00</span><input type="range" id="seek" min="0" max="100" step="0.1" value="0" aria-label="Позиция видео для всех" disabled><span id="duration">0:00</span><button id="enable-sound" class="sound-button" disabled>Включить у меня</button></div><p id="player-status" class="player-status" role="status">Управление общее: пауза и перемотка меняются у всех.</p><form id="video-form" class="video-form"><label for="video-url">Что посмотрим?</label><div><span class="youtube-icon">▶</span><input id="video-url" type="text" maxlength="2048" placeholder="Вставьте ссылку на YouTube" required aria-label="Ссылка на видео YouTube"><button class="primary" type="submit">Смотреть <span>↗</span></button></div></form><div class="room-tip"><span>✧</span><p><b>У каждого свой экран. Момент — общий.</b><br>Отправьте ссылку на зал тому, с кем хочется разделить этот вечер.</p><span class="tip-heart">♡</span></div></div>
-<aside class="chat-panel"><div class="chat-header"><h2>Чатик <span>✦</span></h2><span id="member-count">0 в зале</span></div><div id="members" class="members"></div><div id="messages" class="messages" role="log" aria-live="polite" aria-label="Сообщения чата"><div id="chat-welcome" class="chat-welcome"><span>☕</span><h3>Устраивайтесь поудобнее</h3><p>Здесь можно шептаться.<br>Никто не попросит потише.</p></div></div><form id="chat-form" class="chat-form"><textarea id="chat-text" rows="1" maxlength="1000" placeholder="Сказать что-нибудь…" aria-label="Сообщение" required></textarea><button type="submit" title="Отправить" aria-label="Отправить сообщение">↑</button></form><span class="chat-hint">Enter — отправить · Shift + Enter — новая строка</span></aside></div>
+<div class="evening-toolbar"><div><span class="eyebrow">НАШ ВЕЧЕР</span><strong id="now-title">Выберите видео на вечер</strong><span id="chooser-label">Выбираем вместе</span></div><div class="tool-buttons"><button id="wait-button" class="outline">☕ Жду тебя</button><button id="cinema-mode" class="outline" aria-pressed="false">Режим кино</button><button id="fullscreen" class="outline">На весь экран</button></div></div>
+<div id="waiting-banner" class="waiting-banner" role="status" hidden><b>Никуда не спешим. Ждём друг друга ☕</b><span id="ready-list"></span><button id="ready-button" class="primary">Я готов / готова</button><button id="wait-cancel" class="small-button">Отменить ожидание</button></div>
+<div class="room-grid"><div class="watch-column"><div class="video-shell"><div id="player"></div><video id="direct-video" playsinline preload="metadata" hidden></video><div id="reactions-stage" aria-live="polite" aria-label="Реакции участников"></div><div id="empty-player" class="empty-player"><div class="empty-symbol">▶</div><span class="eyebrow">ЛУЧШЕ, КОГДА ВМЕСТЕ</span><h2>С чего начнём вечер?</h2><p>Добавьте YouTube, MP4 или WebM ниже.<br>Попкорн — по желанию.</p></div></div><div class="player-controls"><button id="play" class="play-button" disabled aria-label="Воспроизвести для всех">▶</button><span id="position">0:00</span><input type="range" id="seek" min="0" max="100" step="0.1" value="0" aria-label="Позиция видео для всех" disabled><span id="duration">0:00</span><button id="enable-sound" class="sound-button" disabled>Включить у меня</button></div><div class="local-controls"><label for="volume">Громкость</label><input id="volume" type="range" min="0" max="100" value="80" aria-label="Громкость на этом устройстве"><button id="chat-toggle" class="outline" aria-pressed="false">Чат</button></div>
+<div class="reactions-bar" aria-label="Реакции"><span>Без слов:</span><button type="button" data-reaction="❤️" aria-label="Сердце">❤️</button><button type="button" data-reaction="😂" aria-label="Смешно">😂</button><button type="button" data-reaction="😳" aria-label="Ого">😳</button><button type="button" data-reaction="🥹" aria-label="Трогательно">🥹</button><button type="button" data-reaction="🔥" aria-label="Огонь">🔥</button><button type="button" data-reaction="🍿" aria-label="Попкорн">🍿</button></div>
+<p id="player-status" class="player-status" role="status">Управление общее: пауза и перемотка меняются у всех.</p><form id="video-form" class="video-form"><label for="video-url">Что посмотрим?</label><div><span class="youtube-icon">▶</span><input id="video-url" type="text" maxlength="2048" placeholder="Ссылка YouTube, MP4 или WebM" required aria-label="Ссылка на видео"><div class="video-submit-buttons"><button id="load-now" class="primary" type="submit">Смотреть <span>↗</span></button><button id="queue-add" class="primary queue-add" type="button">+ В очередь</button></div></div><input id="video-title" class="title-input" maxlength="120" placeholder="Название ролика — по желанию" aria-label="Название ролика"><small class="media-help">YouTube или прямая HTTPS-ссылка на MP4 / WebM. Файлы не загружаются на хостинг.</small></form><div class="voice-panel"><div><strong>Можно шептаться голосом</strong><p id="voice-status" role="status">Микрофон включается только по вашей кнопке.</p></div><div class="voice-buttons"><button id="voice-start" class="outline">Включить микрофон</button><button id="voice-mute" class="outline" hidden>Выключить звук</button><button id="voice-retry" class="outline" hidden>Пересоединить</button></div><audio id="remote-audio" autoplay playsinline></audio><p class="voice-note">Лучше в наушниках. Во время разговора видео станет тише. Для голоса нужен HTTPS; в некоторых сетях — TURN-сервер.</p></div>
+<div class="choice-panel"><span id="choice-status">Следующий ролик выбираете вместе</span><select id="choose-person" aria-label="Кому передать выбор"><option value="">Выбираем вместе</option></select><button id="pass-choice" class="outline">Выбирай ты ♡</button></div>
+<div class="evening-panels"><section class="feature-panel"><div class="panel-heading"><h2>Очередь на вечер <span id="queue-count">0</span></h2><div><button id="queue-shuffle" class="small-button">Перемешать</button><button id="queue-random" class="small-button">Случайное</button></div></div><div id="queue-list" class="feature-list"><p class="empty-note">Добавляйте ролики по очереди. Следующий начнётся автоматически.</p></div><button id="queue-next" class="outline">Следующее видео →</button></section><section class="feature-panel"><h2>Наши моменты ♡</h2><form id="bookmark-form"><input id="bookmark-note" maxlength="160" placeholder="Вот тут мы смеялись…" aria-label="Подпись к моменту" required><button class="outline" type="submit">Сохранить момент</button></form><div id="bookmark-list" class="feature-list"><p class="empty-note">Сохраните таймкод с вашей подписью.</p></div></section><section class="feature-panel history-panel"><h2>История наших вечеров</h2><p class="empty-note">Последние 100 запусков, сгруппированные по дате на вашем устройстве.</p><div id="history-list" class="feature-list"></div></section></div>
+<div class="room-tip"><span>✧</span><p><b>У каждого свой экран. Момент — общий.</b><br>Отправьте ссылку на зал тому, с кем хочется разделить этот вечер.</p><span class="tip-heart">♡</span></div></div>
+<aside class="chat-panel"><div class="chat-header"><h2>Чатик <span>✦</span></h2><span id="member-count">0 в зале</span><button id="chat-close" class="small-button" aria-label="Скрыть чат">×</button></div><div id="members" class="members"></div><div id="messages" class="messages" role="log" aria-live="polite" aria-label="Сообщения чата"><div id="chat-welcome" class="chat-welcome"><span>☕</span><h3>Устраивайтесь поудобнее</h3><p>Здесь можно шептаться.<br>Никто не попросит потише.</p></div></div><form id="chat-form" class="chat-form"><textarea id="chat-text" rows="1" maxlength="1000" placeholder="Сказать что-нибудь…" aria-label="Сообщение" required></textarea><button type="submit" title="Отправить" aria-label="Отправить сообщение">↑</button></form><span class="chat-hint">Enter — отправить · Shift + Enter — новая строка</span></aside></div>
 </section>
 </main><footer><span>вместе лучше <span class="heart">♡</span></span><span>Маленькое место для больших и маленьких моментов.</span><span>YOUTUBE WATCH PARTY</span></footer><div id="toast" role="alert" hidden></div><dialog id="invite-dialog"><form method="dialog"><button class="dialog-close" aria-label="Закрыть">×</button></form><span class="eyebrow">ВАШ ВЕЧЕР НАЧИНАЕТСЯ ЗДЕСЬ</span><h2>Позовите своего человека</h2><p>Любой, у кого есть эта ссылка, сможет войти в зал и управлять видео. Делитесь лично.</p><input id="invite-url" readonly aria-label="Ссылка на зал"><button id="copy-link" class="primary">Скопировать ссылку ↗</button><span id="copy-status" role="status"></span></dialog>
 <script nonce="<?=htmlspecialchars($nonce,ENT_QUOTES)?>">
@@ -202,7 +402,7 @@ async function api(action, data = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     try {
-        const response = await fetch('index.php?api=1', {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}, body:JSON.stringify({action, room:roomId, after:cursor, ...data}), signal:controller.signal});
+        const response = await fetch('index.php?api=1', {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}, body:JSON.stringify({action, room:roomId, after:cursor, signalAfter:signalCursor, ...data}), signal:controller.signal});
         const result = await response.json();
         if (!response.ok) { const e = new Error(result.error || 'Не удалось выполнить запрос.'); e.status = response.status; throw e; }
         result.rtt = Math.min((performance.now() - started) / 1000, 2);
@@ -227,13 +427,14 @@ function accept(data) {
         const name = document.createElement('span'); name.textContent = m.nick;
         const time = document.createElement('time'); const date = new Date(m.created * 1000); time.dateTime = date.toISOString(); time.textContent = date.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
         const body = document.createElement('div'); body.className = 'message-body'; body.textContent = m.body;
+        if (document.querySelector('.chat-panel').classList.contains('is-hidden') && m.member!==data.me.id) $('chat-toggle').textContent='Чат · новое';
         meta.append(name, time); el.append(meta, body); messages.append(el); cursor = Math.max(cursor, Number(m.id));
     }
     while (messages.children.length > 300) messages.firstChild.remove();
     if (nearBottom) messages.scrollTop = messages.scrollHeight;
     $('empty-player').hidden = Boolean(data.state.video);
-    if (data.state.video) ensurePlayer();
-    applyPlayback(); renderControls();
+    if (data.state.video && data.state.source!=='file') ensurePlayer();
+    applyPlayback(); renderControls(); renderFeatures(data);
 }
 function targetPosition() {
     const s = current.state;
@@ -266,35 +467,47 @@ async function ensurePlayer(retry = false) {
     } catch (e) { playerLoading = false; $('player-status').textContent = e.message; }
 }
 function applyPlayback() {
-    if (!playerReady || !current?.state.video) return;
-    const s = current.state, desired = targetPosition();
-    if (video !== s.video) {
-        video = s.video; playerError = false;
-        $('player-status').textContent = 'Видео добавлено. Нажмите ▶, чтобы начать вместе.';
-        player.cueVideoById({videoId:video, startSeconds:desired});
+    if (!current?.state.video) return;
+    const s=current.state, desired=targetPosition();
+    if (s.source==='file') {
+        if (playerReady && player.getPlayerState()===1) player.pauseVideo();
+        $('player').hidden=true;direct.hidden=false;
+        const key=s.video+'|'+s.media_seq;
+        if(fileKey!==key){fileKey=key;direct.src=s.video;direct.load();$('player-status').textContent='Прямое видео · управление общее, громкость ваша';}
+        if(direct.readyState<1)return;
+        const duration=fileAdapter.getDuration();
+        if(Math.abs(direct.currentTime-desired)>(s.playing?1.5:.15))fileAdapter.seekTo(desired);
+        if(duration && desired>=duration-.1){direct.pause();return;}
+        if(s.playing && direct.paused)fileAdapter.playVideo();
+        if(!s.playing && !direct.paused)direct.pause();
+        setLocalVolume();return;
     }
-    if (playerError) return;
-    const state = player.getPlayerState();
-    if (state === -1 || state === 5) {
-        if (s.playing) player.playVideo();
-        if (Math.abs((player.getCurrentTime() || 0) - desired) > 1.5) player.seekTo(desired, true);
-        return;
+    if(!direct.paused)direct.pause();direct.hidden=true;$('player').hidden=false;
+    if(!playerReady){ensurePlayer();return;}
+    if(video!==s.video+'|'+s.media_seq){
+        video=s.video+'|'+s.media_seq;playerError=false;
+        $('player-status').textContent='Видео добавлено. Нажмите ▶, чтобы начать вместе.';
+        player.cueVideoById({videoId:s.video,startSeconds:desired});
     }
-    const duration = player.getDuration();
-    if (duration && desired >= duration - 0.3) { if (state === 1) player.pauseVideo(); return; }
-    if (Math.abs((player.getCurrentTime() || 0) - desired) > 1.5) player.seekTo(desired, true);
-    if (s.playing && state !== 1 && state !== 3) player.playVideo();
-    if (!s.playing && (state === 1 || state === 3)) player.pauseVideo();
+    if(playerError)return;
+    const state=player.getPlayerState();
+    setLocalVolume();
+    if(state===-1||state===5){if(s.playing)player.playVideo();if(Math.abs((player.getCurrentTime()||0)-desired)>(s.playing?1.5:.15))player.seekTo(desired,true);return;}
+    const duration=player.getDuration();
+    if(duration && desired>=duration-.1){if(state===1)player.pauseVideo();return;}
+    if(Math.abs((player.getCurrentTime()||0)-desired)>(s.playing?1.5:.15))player.seekTo(desired,true);
+    if(s.playing && state!==1 && state!==3)player.playVideo();
+    if(!s.playing && (state===1||state===3))player.pauseVideo();
 }
 function formatTime(seconds) { seconds = Math.floor(Math.max(0, seconds || 0)); const h = Math.floor(seconds/3600); const m = Math.floor(seconds/60)%60; return (h ? `${h}:${String(m).padStart(2,'0')}` : String(m)) + ':' + String(seconds%60).padStart(2,'0'); }
 function renderControls() {
     const stale = !lastGood || performance.now() - lastGood > 7000;
     if (stale && joined) { $('connection').textContent = 'Переподключаемся…'; $('connection').classList.add('offline'); }
     const hasVideo = Boolean(current?.state.video);
-    $('play').disabled = !hasVideo || stale || busy;
-    $('seek').disabled = !hasVideo || !playerReady || !player?.getDuration() || stale || busy;
+    $('play').disabled = !hasVideo || stale || busy || Boolean(current?.state.waiting);
+    $('seek').disabled = !hasVideo || Boolean(current?.state.waiting) || !activeReady() || !activePlayer()?.getDuration() || stale || busy;
     $('enable-sound').disabled = !hasVideo;
-    const duration = playerReady ? player.getDuration() : 0;
+    const duration = activeReady() ? activePlayer().getDuration() : 0;
     const position = hasVideo ? targetPosition() : 0;
     const ended = duration > 0 && position >= duration - .3;
     $('play').textContent = current?.state.playing && !ended ? 'Ⅱ' : '▶';
@@ -311,7 +524,7 @@ async function poll() {
     try { accept(await api('state')); }
     catch (e) {
         $('connection').textContent = 'Переподключаемся…'; $('connection').classList.add('offline');
-        if ([401,403,404].includes(e.status)) { joined = false; clearTimeout(timer); toast(e.message); $('lobby').hidden = false; $('room').hidden = true; if (playerReady) player.pauseVideo(); }
+        if ([401,403,404].includes(e.status)) { joined = false; clearTimeout(timer); toast(e.message); $('lobby').hidden = false; $('room').hidden = true; activePlayer()?.pauseVideo(); stopVoice(false); }
     } finally { pollBusy = false; if (joined) timer = setTimeout(poll, document.hidden ? 4000 : 1000); }
 }
 $('join-form').addEventListener('submit', async e => {
@@ -327,24 +540,34 @@ $('join-form').addEventListener('submit', async e => {
 async function control(op, extra = {}) {
     if (!current || busy) return false;
     busy = true; renderControls();
-    try { accept(await api('control', {op, version:current.state.version, ...extra})); return true; }
+    try {
+        const cooldown=Math.max(0,180-(performance.now()-lastControlCompleted));
+        if(cooldown)await new Promise(resolve=>setTimeout(resolve,cooldown));
+        accept(await api('control', {op, version:current.state.version, ...extra})); return true;
+    }
     catch (e) { toast(e.message); if (e.status === 409) { try { accept(await api('state')); } catch {} } return false; }
-    finally { busy = false; renderControls(); }
+    finally { lastControlCompleted=performance.now(); busy = false; renderControls(); }
 }
 $('video-form').addEventListener('submit', async e => {
     e.preventDefault(); if (busy) return;
     const input = $('video-url'), value = input.value;
     const btn = e.currentTarget.querySelector('button'); btn.disabled = true;
-    try { if (await control('load', {url:value.trim()}) && input.value === value) input.value = ''; } finally { btn.disabled = false; }
+    try { if (await control('load', {url:value.trim(), title:$('video-title').value.trim()}) && input.value === value) { input.value = ''; $('video-title').value = ''; } } finally { btn.disabled = false; }
 });
 $('play').addEventListener('click', async () => {
-    if (playerReady) { player.unMute(); if (!current.state.playing) player.playVideo(); }
-    const duration = playerReady ? player.getDuration() : 0;
-    if (duration && targetPosition() >= duration - .3) { await control('replay'); }
-    else await control(current.state.playing ? 'pause' : 'play');
+    if(activeReady()){activePlayer().unMute();if(!current.state.playing)activePlayer().playVideo();}
+    const duration=activeReady()?activePlayer().getDuration():0;
+    if(duration && targetPosition()>=duration-.3)await control('replay');
+    else await control(current.state.playing?'pause':'play');
 });
-$('seek').addEventListener('change', () => control('seek', {position:Number($('seek').value)}));
-$('enable-sound').addEventListener('click', () => { if (!playerReady) { ensurePlayer(true); return; } if (playerError) { video = null; playerError = false; applyPlayback(); } player.unMute(); player.setVolume(100); if (current.state.playing) player.playVideo(); $('player-status').textContent = 'Звук включён на этом устройстве. Кнопка ▶ запускает видео для всех.'; });
+$('seek').addEventListener('change',()=>control('seek',{position:Number($('seek').value)}));
+$('enable-sound').addEventListener('click',()=>{
+    if(current?.state.source!=='file' && !playerReady){ensurePlayer(true);return;}
+    if(playerError){video=null;playerError=false;applyPlayback();}
+    activePlayer()?.unMute();setLocalVolume();
+    if(current.state.playing)activePlayer()?.playVideo();
+    $('player-status').textContent='Звук разрешён на этом устройстве. Кнопка ▶ запускает видео для всех.';
+});
 $('chat-form').addEventListener('submit', async e => {
     e.preventDefault(); const input = $('chat-text'), body = input.value.trim(); if (!body) return;
     const btn = e.currentTarget.querySelector('button'); if (btn.disabled) return; btn.disabled = true;
@@ -354,10 +577,228 @@ $('chat-form').addEventListener('submit', async e => {
 $('chat-text').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('chat-form').requestSubmit(); } });
 $('invite').addEventListener('click', () => { $('invite-url').value = location.href; $('copy-status').textContent = ''; $('invite-dialog').showModal(); });
 $('copy-link').addEventListener('click', async () => { try { await navigator.clipboard.writeText($('invite-url').value); $('copy-status').textContent = 'Ссылка скопирована. Отправьте её лично ♡'; } catch { $('invite-url').select(); $('copy-status').textContent = 'Выделили ссылку — скопируйте её вручную.'; } });
-$('leave').addEventListener('click', async () => { if (busy) return; busy = true; try { await api('leave'); joined = false; clearTimeout(timer); if (playerReady) player.pauseVideo(); location.assign(location.pathname); } catch(e) { toast(e.message); busy = false; } });
+$('leave').addEventListener('click', async () => { if (busy) return; busy = true; try { await stopVoice(); await api('leave'); joined = false; clearTimeout(timer); activePlayer()?.pauseVideo(); stopVoice(false); location.assign(location.pathname); } catch(e) { toast(e.message); busy = false; } });
 document.addEventListener('visibilitychange', () => { if (!document.hidden && joined) { clearTimeout(timer); poll(); } });
 window.addEventListener('online', () => { if (joined) { clearTimeout(timer); poll(); } });
 setInterval(renderControls, 500);
+// Personal evening features. All user strings are inserted as text, never HTML.
+const direct = $('direct-video');
+let lastControlCompleted = 0;
+let fileKey = '', endedVersion = -1, reactionCursor = 0, signalCursor = 0;
+let listsSignature = '', memberSignature = '', voiceQueue = Promise.resolve();
+const fileAdapter = {
+    getDuration: () => Number.isFinite(direct.duration) ? direct.duration : 0,
+    getCurrentTime: () => direct.currentTime || 0,
+    getPlayerState: () => direct.ended ? 0 : direct.paused ? 2 : 1,
+    pauseVideo: () => direct.pause(),
+    playVideo: () => direct.play().catch(() => { $('player-status').textContent = 'Нажмите «Включить у меня», чтобы разрешить воспроизведение.'; }),
+    seekTo: p => { if (direct.readyState >= 1) direct.currentTime = Math.min(p, fileAdapter.getDuration() || p); },
+    unMute: () => { direct.muted = false; },
+    setVolume: v => { direct.volume = Math.min(1, Math.max(0, v / 100)); }
+};
+function activePlayer() { return current?.state.source === 'file' ? fileAdapter : player; }
+function activeReady() { return current?.state.source === 'file' ? direct.readyState >= 1 : playerReady; }
+function setLocalVolume() {
+    const volume = Number($('volume').value) * (voice.stream && voice.pc?.connectionState === 'connected' ? .3 : 1);
+    activePlayer()?.setVolume(volume);
+}
+function autoAdvance() {
+    if (!joined || !current?.state.playing || current.state.waiting || busy || !activeReady() || performance.now()-lastGood>5000) return;
+    const duration = activePlayer().getDuration();
+    if (duration > 0 && targetPosition() >= duration - .1 && endedVersion !== current.state.version) {
+        endedVersion = current.state.version;
+        control('ended', {duration}).then(ok => { if (!ok) endedVersion = -1; });
+    }
+}
+function el(tag, text, className) { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (className) n.className = className; return n; }
+function button(text, fn) { const b = el('button', text); b.type = 'button'; b.addEventListener('click', fn); return b; }
+async function action(name, data = {}) {
+    try { accept(await api(name, data)); return true; } catch (e) { toast(e.message); return false; }
+}
+function featureItem(title, subtitle, buttons) {
+    const n = el('div', undefined, 'feature-item'); n.append(el('strong', title), el('small', subtitle));
+    const actions = el('div', undefined, 'item-actions'); actions.append(...buttons); n.append(actions); return n;
+}
+function renderFeatures(data) {
+    const s=data.state, mine=data.me.id;
+    const chooser=data.members.find(m=>m.id===s.chooser);
+    $('now-title').textContent=s.title || (s.video ? `YouTube · ${s.video}` : 'Выберите видео на вечер');
+    $('chooser-label').textContent=s.chooser ? (chooser ? `Выбирает ${chooser.nick}` : 'Выбиравший участник отошёл — можно вернуть общий выбор') : 'Выбираем вместе';
+    $('choice-status').textContent=$('chooser-label').textContent;
+    $('waiting-banner').hidden=!s.waiting;
+    $('ready-list').textContent=data.members.map(m=>`${m.nick}: ${Number(m.ready) ? 'готовы ✓' : 'ждём'}`).join(' · ') + (data.members.length<2 ? ' · ждём второго участника' : '');
+    $('ready-button').disabled=Boolean(Number(data.me.ready));
+    $('ready-button').textContent=Number(data.me.ready) ? 'Вы готовы ✓' : 'Я готов / готова';
+    $('wait-button').disabled=!s.video || s.waiting;
+    const selectedElsewhere=s.chooser && s.chooser!==mine && chooser;
+    $('load-now').disabled=Boolean(selectedElsewhere || s.waiting || busy);
+    $('queue-next').disabled=!data.queue.length || Boolean(selectedElsewhere || s.waiting || busy);
+    $('queue-random').disabled=$('queue-next').disabled;
+    $('queue-shuffle').disabled=data.queue.length<2 || Boolean(selectedElsewhere);
+    $('bookmark-note').disabled=!s.video;
+    $('bookmark-form').querySelector('button').disabled=!s.video;
+    $('pass-choice').disabled=Boolean(selectedElsewhere);
+    const ms=JSON.stringify(data.members.map(m=>[m.id,m.nick]));
+    if (ms!==memberSignature) {
+        memberSignature=ms; const select=$('choose-person'); const value=select.value;
+        select.replaceChildren(new Option('Выбираем вместе',''), ...data.members.filter(m=>m.id!==mine).map(m=>new Option(m.nick,m.id)));
+        if ([...select.options].some(o=>o.value===value)) select.value=value;
+        if (!value && data.members.length===2) select.value=data.members.find(m=>m.id!==mine).id;
+    }
+    const signature=JSON.stringify([data.queue,data.bookmarks,data.history,Boolean(selectedElsewhere),s.waiting]);
+    if (signature!==listsSignature) {
+        listsSignature=signature;
+        $('queue-count').textContent=String(data.queue.length);
+        $('queue-list').replaceChildren(...data.queue.map((q,i)=>featureItem(`${i+1}. ${q.title}`,`${q.source==='file'?'Файл':'YouTube'} · добавил(а) ${q.nick}`,[
+            button('Смотреть',()=>control('queue_play',{id:Number(q.id)})),button('↑',()=>action('queue',{op:'up',id:Number(q.id)})),button('↓',()=>action('queue',{op:'down',id:Number(q.id)})),button('Убрать',()=>action('queue',{op:'remove',id:Number(q.id)}))
+        ])));
+        if (!data.queue.length) $('queue-list').append(el('p','Здесь будет ваш план на вечер. Добавьте ролик кнопкой «В очередь».','empty-note'));
+        $('bookmark-list').replaceChildren(...data.bookmarks.map(b=>featureItem(`${formatTime(Number(b.position))} · ${b.note}`,`${b.title} · ${b.nick}`,[button('К моменту',()=>control('bookmark',{id:Number(b.id)})),button('Удалить',()=>action('bookmark',{op:'remove',id:Number(b.id)}))])));
+        if (!data.bookmarks.length) $('bookmark-list').append(el('p','Сохраните таймкод с вашей подписью.','empty-note'));
+        const history=$('history-list'); history.replaceChildren(); let day='';
+        for (const h of data.history) {
+            const date=new Date(h.created*1000).toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
+            if (date!==day) { history.append(el('div',date,'history-day')); day=date; }
+            history.append(featureItem(h.title,`${new Date(h.created*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})} · ${h.nick}`,[button('Ещё раз',()=>control('history',{id:Number(h.id)}))]));
+        }
+        if (!data.history.length) history.append(el('p','Ваш первый вечер только начинается ♡','empty-note'));
+        if (selectedElsewhere || s.waiting) {
+            for (const list of [$('queue-list'),$('bookmark-list'),$('history-list')]) for (const item of list.querySelectorAll('.item-actions')) if (item.firstChild) item.firstChild.disabled=true;
+        }
+    }
+    for (const r of data.reactions) {
+        if (Number(r.id)<=reactionCursor) continue;
+        reactionCursor=Number(r.id);
+        const reaction=el('div',undefined,'flying-reaction'); reaction.append(el('p',r.emoji),el('small',r.nick)); $('reactions-stage').append(reaction); setTimeout(()=>reaction.remove(),3000);
+    }
+    voiceQueue=voiceQueue.then(()=>voiceTick(data)).catch(e=>{ clearTimeout(voice.timeout); $('voice-status').textContent='Голос: '+e.message; });
+}
+$('volume').addEventListener('input',setLocalVolume);
+$('queue-add').addEventListener('click',async()=>{
+    const value=$('video-url').value.trim(); if (!value) { $('video-url').reportValidity(); return; }
+    $('queue-add').disabled=true;
+    try { if (await action('queue',{op:'add',url:value,title:$('video-title').value.trim()})) { $('video-url').value=''; $('video-title').value=''; toast('Добавлено в очередь на вечер'); } } finally { $('queue-add').disabled=false; }
+});
+$('queue-next').addEventListener('click',()=>control('next'));
+$('queue-random').addEventListener('click',()=>control('random'));
+$('queue-shuffle').addEventListener('click',()=>action('queue',{op:'shuffle'}));
+$('wait-button').addEventListener('click',()=>control('wait'));
+$('wait-cancel').addEventListener('click',()=>control('wait_cancel'));
+$('ready-button').addEventListener('click',async()=>{ $('ready-button').disabled=true; await action('ready'); });
+$('pass-choice').addEventListener('click',()=>control('pass',{target:$('choose-person').value || null}));
+$('bookmark-form').addEventListener('submit',async e=>{e.preventDefault();const note=$('bookmark-note').value.trim(); if (!note) return; const b=e.currentTarget.querySelector('button'); b.disabled=true;try {if(await action('bookmark',{note})) $('bookmark-note').value='';}finally{b.disabled=false;}});
+for (const b of document.querySelectorAll('[data-reaction]')) b.addEventListener('click',()=>action('reaction',{emoji:b.dataset.reaction}));
+$('cinema-mode').addEventListener('click',()=>{ const on=document.body.classList.toggle('cinema'); $('cinema-mode').setAttribute('aria-pressed',String(on)); $('cinema-mode').textContent=on?'Обычный режим':'Режим кино'; });
+function setChatClosed(closed){
+    document.querySelector('.chat-panel').classList.toggle('is-hidden',closed);
+    document.querySelector('.room-grid').classList.toggle('chat-closed',closed);
+    $('chat-toggle').setAttribute('aria-pressed',String(!closed));
+    if(!closed){$('chat-toggle').textContent='Чат';$('messages').scrollTop=$('messages').scrollHeight;}
+}
+$('chat-toggle').addEventListener('click',()=>setChatClosed(!document.querySelector('.chat-panel').classList.contains('is-hidden')));
+$('chat-close').addEventListener('click',()=>setChatClosed(true));
+if(innerWidth<761)setChatClosed(true);
+
+$('fullscreen').addEventListener('click',async()=>{try{if(document.fullscreenElement) await document.exitFullscreen();else if(document.querySelector('.watch-column').requestFullscreen) await document.querySelector('.watch-column').requestFullscreen();else if(current.state.source==='file' && direct.webkitEnterFullscreen) direct.webkitEnterFullscreen();else toast('Полноэкранный режим недоступен в этом браузере. Используйте режим кино.');}catch{toast('Браузер не разрешил полноэкранный режим.');}});
+direct.addEventListener('loadedmetadata',()=>{applyPlayback();renderControls();setLocalVolume();});
+direct.addEventListener('error',()=>{ if(current?.state.source==='file') $('player-status').textContent='Файл недоступен или формат не поддерживается. Нужна прямая доступная обоим HTTPS-ссылка на MP4 / WebM.'; });
+direct.addEventListener('ended',autoAdvance);
+setInterval(autoAdvance,700);
+
+// Voice is opt-in, two-person WebRTC. PHP is only a short-lived signaling relay.
+const voice={stream:null,pc:null,remote:null,peer:null,session:null,candidates:[],signalChain:Promise.resolve(),muted:false,starting:false,timeout:null,stopping:false};
+function peerId(){return [...crypto.getRandomValues(new Uint8Array(16))].map(n=>n.toString(16).padStart(2,'0')).join('');}
+function resetConnection() {
+    clearTimeout(voice.timeout);
+    if (voice.pc) { voice.pc.onconnectionstatechange=null;voice.pc.onicecandidate=null;voice.pc.ontrack=null;voice.pc.close(); }
+    voice.pc=null;voice.remote=null;voice.session=null;voice.candidates=[];
+    $('remote-audio').srcObject=null;
+    setLocalVolume();
+}
+function sendSignal(payload) {
+    const peer=voice.peer,target=voice.remote;
+    voice.signalChain=voice.signalChain.catch(()=>{}).then(async()=>{
+        if (!voice.stream || peer!==voice.peer || target!==voice.remote) return;
+        // Keep ICE signaling sequential and below the server's burst limit.
+        await new Promise(resolve=>setTimeout(resolve,25));
+        accept(await api('signal',{peer,target,payload}));
+    });
+    voice.signalChain.catch(e=>{if(voice.stream)$('voice-status').textContent='Не удалось передать голосовой сигнал: '+e.message;});
+    return voice.signalChain;
+}
+async function connectVoice(remote,data) {
+    resetConnection();voice.remote=remote;voice.session=voice.peer;
+    const pc=new RTCPeerConnection({iceServers:data.iceServers||[]});voice.pc=pc;
+    for(const track of voice.stream.getTracks()) pc.addTrack(track,voice.stream);
+    pc.onicecandidate=e=>{if(e.candidate)sendSignal({type:'candidate',candidate:e.candidate.toJSON()});};
+    pc.ontrack=e=>{ $('remote-audio').srcObject=e.streams[0];$('remote-audio').play().catch(()=>{$('voice-status').textContent='Нажмите «Слышать голос», чтобы включить звук собеседника.';$('voice-retry').hidden=false;$('voice-retry').textContent='Слышать голос';}); };
+    pc.onconnectionstatechange=()=>{
+        if(pc!==voice.pc)return;
+        const state=pc.connectionState;
+        if(state==='connected'){clearTimeout(voice.timeout);$('voice-status').textContent=voice.muted?'Вы на связи · ваш микрофон выключен':'Вы на связи · микрофон включён';$('voice-retry').hidden=true;}
+        else if(state==='failed'||state==='disconnected'){$('voice-status').textContent='Голос прервался. Пересоединитесь; если не поможет, нужен TURN-сервер.';$('voice-retry').hidden=false;$('voice-retry').textContent='Пересоединить';}
+        setLocalVolume();
+    };
+    $('voice-status').textContent='Соединяем голос…';
+    voice.timeout=setTimeout(()=>{if(voice.pc===pc && pc.connectionState!=='connected'){$('voice-status').textContent='Голос не соединился. Попробуйте пересоединить; для этих сетей может потребоваться TURN.';$('voice-retry').hidden=false;}},18000);
+    // Lexical ordering elects one offerer and prevents offer glare.
+    if(voice.peer<remote){await pc.setLocalDescription(await pc.createOffer());await sendSignal({type:'offer',sdp:pc.localDescription.sdp});}
+}
+async function voiceTick(data) {
+    if(!voice.stream || data.serverTime<current.serverTime)return;
+    if(data.me.voice!==voice.peer){await stopVoice(false);$('voice-status').textContent='Голос включён в другой вкладке. В этой вкладке микрофон остановлен.';return;}
+    const remote=data.members.find(m=>m.id!==data.me.id && m.voice);
+    if(!remote){if(voice.pc)resetConnection();$('voice-status').textContent='Микрофон включён · ждём, когда второй участник тоже включит голос.';return;}
+    if(voice.remote!==remote.voice)await connectVoice(remote.voice,data);
+    const pc=voice.pc;
+    for(const signal of data.signals){
+        if(Number(signal.id)<=signalCursor)continue;signalCursor=Number(signal.id);
+        if(signal.sender!==voice.remote || !pc)continue;
+        const payload=signal.payload;
+        if(payload.type==='offer'){
+            if(voice.peer<voice.remote)continue;
+            await pc.setRemoteDescription({type:'offer',sdp:payload.sdp});
+            for(const candidate of voice.candidates.splice(0))await pc.addIceCandidate(candidate);
+            await pc.setLocalDescription(await pc.createAnswer());await sendSignal({type:'answer',sdp:pc.localDescription.sdp});
+        }else if(payload.type==='answer'){
+            if(pc.signalingState!=='have-local-offer')continue;
+            await pc.setRemoteDescription({type:'answer',sdp:payload.sdp});
+            for(const candidate of voice.candidates.splice(0))await pc.addIceCandidate(candidate);
+        }else if(payload.type==='candidate'){
+            if(pc.remoteDescription)await pc.addIceCandidate(payload.candidate);else voice.candidates.push(payload.candidate);
+        }
+    }
+}
+async function stopVoice(notify=true) {
+    if(voice.stopping)return;voice.stopping=true;
+    const peer=voice.peer;
+    if(voice.stream)voice.stream.getTracks().forEach(t=>t.stop());voice.stream=null;resetConnection();voice.peer=null;signalCursor=0;
+    $('voice-start').textContent='Включить микрофон';$('voice-start').classList.remove('active');$('voice-mute').hidden=true;$('voice-retry').hidden=true;
+    $('voice-status').textContent='Микрофон выключен.';
+    try{if(notify&&peer&&joined)await action('voice',{op:'leave',peer});}finally{voice.stopping=false;}
+}
+async function startVoice(){
+    if(voice.starting)return; if(voice.stream){await stopVoice();return;}
+    if(!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection){toast('Для голоса откройте сайт по HTTPS в браузере с поддержкой WebRTC.');return;}
+    voice.starting=true;$('voice-start').disabled=true;
+    try{
+        voice.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+        voice.peer=peerId();voice.muted=false;signalCursor=0;
+        for(const track of voice.stream.getTracks()) track.onended=()=>{if(voice.stream){stopVoice();toast('Микрофон отключён браузером.');}};
+        const result=await api('voice',{op:'join',peer:voice.peer});
+        $('voice-start').textContent='Завершить голос';$('voice-start').classList.add('active');$('voice-mute').hidden=false;$('voice-mute').textContent='Выключить микрофон';
+        accept(result);
+    }catch(e){await stopVoice(false);toast(e.name==='NotAllowedError'?'Разрешите доступ к микрофону в настройках браузера.':e.message);}
+    finally{voice.starting=false;$('voice-start').disabled=false;}
+}
+$('voice-start').addEventListener('click',startVoice);
+$('voice-mute').addEventListener('click',()=>{voice.muted=!voice.muted;voice.stream?.getAudioTracks().forEach(t=>t.enabled=!voice.muted);$('voice-mute').textContent=voice.muted?'Включить микрофон':'Выключить микрофон';$('voice-status').textContent=voice.muted?'Ваш микрофон выключен · собеседника по-прежнему слышно':'Микрофон включён';});
+$('voice-retry').addEventListener('click',async()=>{if($('voice-retry').textContent==='Слышать голос'){$('remote-audio').play().then(()=>$('voice-retry').hidden=true).catch(()=>toast('Браузер не разрешил звук.'));return;}await stopVoice();await startVoice();});
+window.addEventListener('pagehide',()=>{
+    voice.stream?.getTracks().forEach(t=>t.stop());
+    if(voice.peer && joined)fetch('index.php?api=1',{method:'POST',credentials:'same-origin',keepalive:true,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action:'voice',op:'leave',room:roomId,peer:voice.peer})}).catch(()=>{});
+});
+window.addEventListener('pageshow',e=>{if(e.persisted && voice.stream)stopVoice();});
 
 </script>
 </body></html>

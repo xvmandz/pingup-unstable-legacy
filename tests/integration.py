@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -133,6 +134,119 @@ class WatchTests(unittest.TestCase):
         self.b.call('join', nick='Маша')
         self.assertEqual(len(self.a.call('state')['members']), 2)
 
+    def test_wait_for_both_and_preserve_position(self):
+        self.b.call('join', nick='Маша')
+        self.a.call('control', op='load', url='dQw4w9WgXcQ', version=0)
+        time.sleep(.17)
+        self.a.call('control', op='play', version=1)
+        time.sleep(.2)
+        waiting = self.a.call('control', op='wait', version=2)
+        self.assertTrue(waiting['state']['waiting'])
+        self.assertFalse(waiting['state']['playing'])
+        self.assertTrue(all(not m['ready'] for m in waiting['members']))
+        one = self.a.call('ready')
+        self.assertTrue(one['state']['waiting'])
+        self.b.call('control', expected=409, op='play', version=3)
+        both = self.b.call('ready')
+        self.assertFalse(both['state']['waiting'])
+        self.assertTrue(both['state']['playing'])
+        self.assertAlmostEqual(both['state']['position'], waiting['state']['position'])
+        time.sleep(.17)
+        self.a.call('control', op='wait', version=4)
+        time.sleep(.17)
+        cancelled = self.a.call('control', op='wait_cancel', version=5)
+        self.assertFalse(cancelled['state']['waiting'])
+        self.assertFalse(cancelled['state']['playing'])
+
+    def test_queue_reorder_random_and_auto_advance(self):
+        self.b.call('join', nick='Маша')
+        q1 = self.a.call('queue', op='add', url='dQw4w9WgXcQ', title='Первое')['queue'][0]
+        q2 = self.b.call('queue', op='add', url='https://example.com/second.webm', title='Второе')['queue'][1]
+        time.sleep(.21)
+        moved = self.b.call('queue', op='up', id=q2['id'])
+        self.assertEqual(moved['queue'][0]['title'], 'Второе')
+        chosen = self.a.call('control', op='queue_play', id=q1['id'], version=0)
+        self.assertEqual(len(chosen['queue']), 1)
+        time.sleep(.17)
+        self.a.call('control', op='play', version=1)
+        time.sleep(.17)
+        self.a.call('control', op='seek', position=5, version=2)
+        time.sleep(.17)
+        advanced = self.a.call('control', op='ended', duration=5, version=3)
+        self.assertEqual(advanced['state']['source'], 'file')
+        self.assertTrue(advanced['state']['playing'])
+        self.assertEqual(advanced['queue'], [])
+        self.assertEqual(len(advanced['history']), 2)
+        self.b.call('control', expected=409, op='ended', duration=5, version=3)
+
+    def test_bookmarks_history_and_room_isolation(self):
+        self.a.call('control', op='load', url='dQw4w9WgXcQ', title='Наш ролик', version=0)
+        time.sleep(.17)
+        self.a.call('control', op='seek', position=25.5, version=1)
+        saved = self.a.call('bookmark', note='<b>Смешной момент</b>')
+        bookmark = saved['bookmarks'][0]
+        self.assertEqual(bookmark['position'], 25.5)
+        self.assertEqual(bookmark['note'], '<b>Смешной момент</b>')
+        time.sleep(.17)
+        self.a.call('control', op='load', url='https://example.com/movie.mp4', version=2)
+        time.sleep(.17)
+        restored = self.a.call('control', op='bookmark', id=bookmark['id'], version=3)
+        self.assertEqual(restored['state']['video'], 'dQw4w9WgXcQ')
+        self.assertEqual(restored['state']['position'], 25.5)
+        self.assertEqual(len(restored['history']), 3)
+        c = Client()
+        other = c.call('create', nick='Другой')
+        self.assertEqual(other['bookmarks'], [])
+        c.call('control', expected=404, op='bookmark', id=bookmark['id'], version=0)
+
+    def test_pass_choice_enforced_on_server(self):
+        b = self.b.call('join', nick='Маша')
+        self.a.call('control', op='pass', target=b['me']['id'], version=0)
+        time.sleep(.17)
+        self.a.call('control', expected=403, op='load', url='dQw4w9WgXcQ', version=1)
+        self.b.call('control', op='load', url='dQw4w9WgXcQ', version=1)
+        time.sleep(.17)
+        self.b.call('control', op='pass', target=None, version=2)
+        self.a.call('control', op='load', url='dQw4w9WgXcQ', version=3)
+
+    def test_reactions_and_validation(self):
+        self.b.call('join', nick='Маша')
+        sent = self.a.call('reaction', emoji='❤️')
+        self.assertEqual(self.b.call('state')['reactions'], sent['reactions'])
+        self.a.call('reaction', expected=429, emoji='😂')
+        self.a.call('reaction', expected=422, emoji='<script>')
+        self.a.call('queue', expected=422, op='add', url='http://example.com/movie.mp4')
+        self.a.call('queue', expected=422, op='add', url='https://name:pass@example.com/movie.mp4')
+        self.a.call('queue', expected=422, op='add', url='https://example.com/script.php')
+        file = self.a.call('control', op='load', url='https://example.com/movie.mp4?download=1', version=0)
+        self.assertEqual(file['state']['source'], 'file')
+
+    def test_voice_signals_are_scoped_and_cursor_based(self):
+        self.b.call('join', nick='Маша')
+        pa, pb = 'a'*32, 'b'*32
+        self.a.call('voice', op='join', peer=pa)
+        self.b.call('voice', op='join', peer=pb)
+        sent = self.a.call('signal', peer=pa, target=pb, payload={'type':'offer','sdp':'v=0'})
+        self.assertEqual(sent['signals'], [])
+        received = self.b.call('state')['signals']
+        self.assertEqual(received[0]['payload'], {'type':'offer','sdp':'v=0'})
+        self.assertEqual(self.b.call('state', signalAfter=received[0]['id'])['signals'], [])
+        time.sleep(.02)
+        self.a.call('signal', expected=403, peer='c'*32, target=pb, payload={'type':'offer','sdp':'v=0'})
+        self.a.call('signal', expected=422, peer=pa, target=pb, payload={'type':'script','sdp':'x'})
+        self.b.call('voice', op='leave', peer=pb)
+        self.assertEqual(self.b.call('state')['signals'], [])
+        self.a.call('signal', expected=404, peer=pa, target=pb, payload={'type':'offer','sdp':'v=0'})
+
+    def test_upgrade_keeps_existing_room(self):
+        c = Client()
+        c.room = 'f'*32
+        upgraded = c.call('join', nick='После обновления')
+        self.assertEqual(upgraded['state']['video'], 'dQw4w9WgXcQ')
+        self.assertEqual(upgraded['state']['source'], 'youtube')
+        self.assertEqual(upgraded['state']['position'], 17.5)
+        self.assertEqual(upgraded['queue'], [])
+
     def test_production_document_root(self):
         for path in ['../var/watch.sqlite', 'src/bootstrap.php', 'var/watch.sqlite', '.git/config']:
             try:
@@ -150,6 +264,9 @@ if __name__ == '__main__':
         DOCROOT = Path(temp)/'site'
         DOCROOT.mkdir()
         (DOCROOT/'index.php').write_bytes((ROOT/'index.php').read_bytes())
+        with sqlite3.connect(temp + '/test.sqlite') as db:
+            db.execute('CREATE TABLE rooms (id TEXT PRIMARY KEY,video TEXT,position REAL NOT NULL DEFAULT 0,playing INTEGER NOT NULL DEFAULT 0,updated REAL NOT NULL,version INTEGER NOT NULL DEFAULT 0)')
+            db.execute('INSERT INTO rooms VALUES(?,?,?,?,?,?)', ('f'*32,'dQw4w9WgXcQ',17.5,0,time.time(),0))
         env = dict(os.environ, WATCH_DB=temp + '/test.sqlite', PHP_CLI_SERVER_WORKERS='4')
         log = open(temp + '/server.log', 'w+')
         process = subprocess.Popen([os.environ.get('PHP_BIN', 'php'), '-S', f'127.0.0.1:{port}', '-t', str(DOCROOT)], env=env, stdout=log, stderr=log, start_new_session=True)
